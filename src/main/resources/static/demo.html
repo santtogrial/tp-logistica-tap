@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Demo de tracking - Logística</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.0.0/bundles/stomp.umd.min.js"></script>
+    <style>
+        body { margin: 0; font-family: system-ui, sans-serif; font-size: 14px; display: flex; height: 100vh; color: #222; }
+        #mapa { flex: 1; }
+        aside { width: 380px; overflow-y: auto; padding: 12px; background: #f6f6f6; border-left: 1px solid #ddd; }
+        h1 { font-size: 16px; margin: 0 0 4px; }
+        p.nota { margin: 0 0 12px; color: #666; font-size: 12px; }
+        section { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 10px; margin-bottom: 12px; }
+        h2 { font-size: 14px; margin: 0 0 8px; }
+        input { width: 100%; box-sizing: border-box; padding: 6px; margin-bottom: 6px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 6px 10px; border: 0; border-radius: 4px; background: #2563eb; color: #fff; cursor: pointer; margin: 0 4px 6px 0; }
+        button:disabled { background: #9ca3af; cursor: default; }
+        .estado { font-weight: 600; }
+        #log { font-family: ui-monospace, monospace; font-size: 11px; max-height: 220px; overflow-y: auto; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+<div id="mapa"></div>
+<aside>
+    <h1>Demo de tracking en tiempo real</h1>
+    <p class="nota">Página de prueba para ver el WebSocket funcionando. El resto de la API se prueba con Postman o Swagger.</p>
+
+    <section>
+        <h2>1. Destinatario: seguir un pedido</h2>
+        <input id="codigo" placeholder="Código de seguimiento (ej. LG-7Q4K2M9X)">
+        <button id="btnSeguir">Seguir pedido</button>
+        <div>Estado: <span id="estadoPedido" class="estado">-</span></div>
+        <div id="etaPedido"></div>
+    </section>
+
+    <section>
+        <h2>2. Chofer: simular el recorrido</h2>
+        <input id="emailChofer" value="chofer1@logistica.com">
+        <input id="passChofer" type="password" value="chofer123">
+        <button id="btnRuta">Ingresar y ver mi ruta</button>
+        <button id="btnSimular" disabled>Simular recorrido</button>
+        <div id="infoRuta"></div>
+    </section>
+
+    <section>
+        <h2>3. Operador: ver toda la flota</h2>
+        <input id="emailOperador" value="operador@logistica.com">
+        <input id="passOperador" type="password" value="operador123">
+        <button id="btnFlota">Ingresar y suscribirse</button>
+    </section>
+
+    <section>
+        <h2>Mensajes recibidos</h2>
+        <div id="log"></div>
+    </section>
+</aside>
+
+<script>
+    const mapa = L.map('mapa').setView([-34.595, -58.43], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    }).addTo(mapa);
+
+    const marcadores = {};
+    let capaRuta = null;
+    let tokenChofer = null;
+    let rutaActual = null;
+
+    function log(texto) {
+        const div = document.getElementById('log');
+        div.textContent = new Date().toLocaleTimeString() + '  ' + texto + '\n' + div.textContent;
+    }
+
+    async function api(metodo, url, cuerpo, token) {
+        const headers = { 'Content-Type': 'application/json' };
+        if (token) headers.Authorization = 'Bearer ' + token;
+        const res = await fetch(url, { method: metodo, headers, body: cuerpo ? JSON.stringify(cuerpo) : undefined });
+        const datos = await res.json().catch(() => null);
+        if (!res.ok) throw new Error((datos && datos.mensaje) || res.status);
+        return datos;
+    }
+
+    async function login(email, password) {
+        const r = await api('POST', '/api/auth/login', { email, password });
+        log('Login correcto: ' + r.nombre + ' (' + r.rol + ')');
+        return r.token;
+    }
+
+    function conectar(token, alConectar) {
+        const cliente = new StompJs.Client({
+            brokerURL: 'ws://' + location.host + '/ws',
+            connectHeaders: token ? { Authorization: 'Bearer ' + token } : {},
+            reconnectDelay: 3000
+        });
+        cliente.onConnect = () => alConectar(cliente);
+        cliente.onStompError = frame => log('Error WebSocket: ' + frame.headers.message);
+        cliente.activate();
+        return cliente;
+    }
+
+    function moverMarcador(id, lat, lng, texto) {
+        if (!marcadores[id]) {
+            marcadores[id] = L.marker([lat, lng]).addTo(mapa).bindTooltip(texto, { permanent: true });
+        } else {
+            marcadores[id].setLatLng([lat, lng]);
+        }
+    }
+
+    // 1. Destinatario
+    let clienteSeguimiento = null;
+    document.getElementById('btnSeguir').onclick = async () => {
+        const codigo = document.getElementById('codigo').value.trim().toUpperCase();
+        if (!codigo) return;
+        try {
+            const s = await api('GET', '/api/seguimiento/' + codigo);
+            document.getElementById('estadoPedido').textContent = s.estado;
+            if (s.enCamino) {
+                document.getElementById('etaPedido').textContent =
+                    'Paradas antes que la tuya: ' + s.enCamino.paradasAntes + ' - llega en ~' + s.enCamino.etaMin + ' min';
+                if (s.enCamino.lat) moverMarcador('pedido', s.enCamino.lat, s.enCamino.lng, 'Tu pedido');
+            }
+        } catch (e) {
+            log('Seguimiento: ' + e.message);
+            return;
+        }
+        if (clienteSeguimiento) clienteSeguimiento.deactivate();
+        clienteSeguimiento = conectar(null, c => {
+            c.subscribe('/topic/seguimiento/' + codigo, msg => {
+                const m = JSON.parse(msg.body);
+                document.getElementById('estadoPedido').textContent = m.estado;
+                if (m.tipo === 'POSICION') moverMarcador('pedido', m.lat, m.lng, 'Tu pedido');
+                log('[seguimiento ' + codigo + '] ' + m.tipo + ' ' + m.estado);
+            });
+            log('Suscripto a /topic/seguimiento/' + codigo);
+        });
+    };
+
+    // 2. Chofer
+    document.getElementById('btnRuta').onclick = async () => {
+        try {
+            tokenChofer = await login(document.getElementById('emailChofer').value, document.getElementById('passChofer').value);
+            rutaActual = await api('GET', '/api/rutas/actual', null, tokenChofer);
+        } catch (e) {
+            log('Chofer: ' + e.message);
+            return;
+        }
+        if (capaRuta) capaRuta.remove();
+        const puntos = [[rutaActual.origenLat, rutaActual.origenLng],
+            ...rutaActual.paradas.map(p => [p.lat, p.lng]), [rutaActual.origenLat, rutaActual.origenLng]];
+        capaRuta = L.layerGroup([L.polyline(puntos, { color: '#2563eb' }),
+            ...rutaActual.paradas.map(p => L.circleMarker([p.lat, p.lng], { radius: 7 })
+                .bindTooltip(p.secuencia + '. ' + p.codigoSeguimiento))]).addTo(mapa);
+        mapa.fitBounds(puntos);
+        document.getElementById('infoRuta').textContent = 'Ruta ' + rutaActual.id + ' (' + rutaActual.patente + ') - '
+            + rutaActual.estado + ' - ' + rutaActual.paradas.length + ' paradas, ' + rutaActual.distanciaKm + ' km';
+        document.getElementById('btnSimular').disabled = rutaActual.estado !== 'EN_CURSO';
+        if (rutaActual.estado !== 'EN_CURSO') log('La ruta está PLANIFICADA: iniciala (POST /api/rutas/' + rutaActual.id + '/iniciar) para simular');
+    };
+
+    document.getElementById('btnSimular').onclick = async () => {
+        document.getElementById('btnSimular').disabled = true;
+        const tramo = [[rutaActual.origenLat, rutaActual.origenLng],
+            ...rutaActual.paradas.filter(p => !p.resultado).map(p => [p.lat, p.lng])];
+        const pasosPorTramo = 6;
+        for (let i = 0; i < tramo.length - 1; i++) {
+            for (let paso = 1; paso <= pasosPorTramo; paso++) {
+                const lat = tramo[i][0] + (tramo[i + 1][0] - tramo[i][0]) * paso / pasosPorTramo;
+                const lng = tramo[i][1] + (tramo[i + 1][1] - tramo[i][1]) * paso / pasosPorTramo;
+                try {
+                    await api('POST', '/api/vehiculos/' + rutaActual.vehiculoId + '/posicion', { lat, lng }, tokenChofer);
+                } catch (e) {
+                    log('Posición rechazada: ' + e.message);
+                    return;
+                }
+                moverMarcador('chofer', lat, lng, rutaActual.patente);
+                await new Promise(r => setTimeout(r, 1200));
+            }
+        }
+        log('Simulación terminada');
+        document.getElementById('btnSimular').disabled = false;
+    };
+
+    // 3. Operador
+    document.getElementById('btnFlota').onclick = async () => {
+        let token;
+        try {
+            token = await login(document.getElementById('emailOperador').value, document.getElementById('passOperador').value);
+        } catch (e) {
+            log('Operador: ' + e.message);
+            return;
+        }
+        conectar(token, c => {
+            c.subscribe('/topic/vehiculos', msg => {
+                const p = JSON.parse(msg.body);
+                moverMarcador('flota-' + p.vehiculoId, p.lat, p.lng, p.patente);
+                log('[flota] ' + p.patente + ' ' + p.lat.toFixed(4) + ', ' + p.lng.toFixed(4));
+            });
+            log('Suscripto a /topic/vehiculos');
+        });
+    };
+</script>
+</body>
+</html>
